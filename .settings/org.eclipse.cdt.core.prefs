@@ -1,0 +1,12 @@
+eclipse.preferences.version=1
+environment/project/cdt.managedbuild.toolchain.gnu.cross.base.1708712503/BATCH_BUILD/delimiter=;
+environment/project/cdt.managedbuild.toolchain.gnu.cross.base.1708712503/BATCH_BUILD/operation=append
+environment/project/cdt.managedbuild.toolchain.gnu.cross.base.1708712503/BATCH_BUILD/value=1
+environment/project/cdt.managedbuild.toolchain.gnu.cross.base.1708712503/IDF_PATH/delimiter=;
+environment/project/cdt.managedbuild.toolchain.gnu.cross.base.1708712503/IDF_PATH/operation=replace
+environment/project/cdt.managedbuild.toolchain.gnu.cross.base.1708712503/IDF_PATH/value=C\:/msys32/esp-idf
+environment/project/cdt.managedbuild.toolchain.gnu.cross.base.1708712503/PATH/delimiter=;
+environment/project/cdt.managedbuild.toolchain.gnu.cross.base.1708712503/PATH/operation=replace
+environment/project/cdt.managedbuild.toolchain.gnu.cross.base.1708712503/PATH/value=C\:\\WINDOWS\\system32;C\:\\WINDOWS;C\:\\WINDOWS\\System32\\Wbem;C\:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\;C\:\\dev\\tools\\apache-maven-3.3.3\\bin;C\:\\Program Files (x86)\\Nordic Semiconductor\\nrf5x\\bin\\;C\:\\Program Files\\IBM\\Bluemix\\bin;%USERPROFILE%\\AppData\\Local\\Programs\\Python\\Python35\\;%USERPROFILE%\\AppData\\Local\\Microsoft\\WindowsApps;;C\:\\Users\\glamp\\Downloads;C\:\\msys32\\opt\\xtensa-esp32-elf\\bin;C\:\\msys32\\usr\\bin;C\:\\msys32\\mingw32\\bin;
+environment/project/cdt.managedbuild.toolchain.gnu.cross.base.1708712503/append=true
+environment/project/cdt.managedbuild.toolchain.gnu.cross.base.1708712503/appendContributed=true

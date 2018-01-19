@@ -40,6 +40,20 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
+#include "freertos/event_groups.h"
+#include "esp_wifi.h"
+#include "esp_event_loop.h"
+#include "nvs_flash.h"
+#include "esp_log.h"
+
+#include "driver/gpio.h"
+#include "mdns.h"
+
+#include "lwip/api.h"
+#include "lwip/err.h"
+#include "lwip/netdb.h"
+
+
 #define GATTC_TAG "SENSOR_READ"
 #define REMOTE_SERVICE_UUID        0x00FF
 #define REMOTE_NOTIFY_CHAR_UUID    0xCA9E
@@ -51,20 +65,20 @@
 static const esp_gatt_auth_req_t gattc_auth_request_none = ESP_GATT_AUTH_REQ_NONE;
 
 static const char remote_device_name[] = "SENSOR";
-static const uint8_t service_id[] = {0x6E, 0x40, 0x00, 0x01, 0xB5, 0xA3, 0xF3, 0x93, 0xE0, 0xA9, 0xE5, 0x0E, 0x24, 0xDC, 0xCA, 0x9E};
+static const uint8_t service_id[] = {0x6E, 0x40, 0x00, 0x01, 0xB5, 0xA3, 0xF3, 0x93, 0xE0, 0xA9, 0xE5, 0x0E, 0x24, 0xDC, 0xCA, 0x9E}; // needs to be reversed
 static bool connect    = false;
 static bool get_server = false;
 static esp_gattc_char_elem_t *char_elem_result   = NULL;
 //static esp_gattc_service_elem_t *service_elem_result = NULL;
 static esp_gattc_descr_elem_t *descr_elem_result = NULL;
-static uint8_t charac_handles[] = {0x0b, 0x0e, 0x11, 0x12, 0x14, 0x17, 0x18, 0x19};
+static uint8_t charac_handles[] = {0x11, 0x14, 0x17};
+static esp_bt_uuid_t charac_uuids[3];
 static int charac_pointer = 0;
 
 /* declare static functions */
 static void esp_gap_cb(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *param);
 static void esp_gattc_cb(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_if, esp_ble_gattc_cb_param_t *param);
 static void gattc_profile_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_if, esp_ble_gattc_cb_param_t *param);
-
 
 /* static esp_bt_uuid_t remote_filter_service_uuid = {
     .len = ESP_UUID_LEN_128,
@@ -97,8 +111,9 @@ struct gattc_profile_inst {
     uint16_t service_start_handle;
     uint16_t service_end_handle;
     uint16_t char_handle;
+    esp_bt_uuid_t uuid;
     esp_bd_addr_t remote_bda;
-    uint16_t rssi;
+    int16_t rssi;
 };
 
 /* One gatt-based profile one app_id and one gattc_if, this array will store the gattc_if returned by ESP_GATTS_REG_EVT */
@@ -111,6 +126,38 @@ static struct gattc_profile_inst gl_profile_tab[PROFILE_NUM] = {
 
 static bool bt_scan_done = false;
 
+//*********************************************
+// web server variables
+
+// HTTP headers and web pages
+const static char http_html_hdr[] = "HTTP/1.1 200 OK\nContent-type: text/html\n\n";
+const static char http_png_hdr[] = "HTTP/1.1 200 OK\nContent-type: image/png\n\n";
+const static char http_page_hdr[] = "<meta content=\"width=device-width,initial-scale=1\"name=viewport><style>div{width:230px;height:300px;position:absolute;top:0;bottom:0;left:0;right:0;margin:auto}</style>";
+const static char http_page_body[] = "<div><h1 align=center>Sensor %s detected</h1><p>%s RSSI is: %s<p>Human detected: %d</div>";
+const static char http_on_hml[] = "<div><h1 align=center>Relay is ON</h1><a href=off.html><img src=off.png></a></div>";
+
+// embedded binary data
+extern const uint8_t on_png_start[] asm("_binary_on_png_start");
+extern const uint8_t on_png_end[]   asm("_binary_on_png_end");
+extern const uint8_t off_png_start[] asm("_binary_off_png_start");
+extern const uint8_t off_png_end[]   asm("_binary_off_png_end");
+
+
+// Event group for inter-task communication
+static EventGroupHandle_t event_group;
+const int WIFI_CONNECTED_BIT = BIT0;
+
+// actual relay status
+bool relay_status;
+
+int16_t sensorRssi = 0;
+bool sensorFound = false;
+
+
+
+
+
+// *****************************************
 
 /* Read a characteristic for ITC PolyU HK sensor.
    Called whenever a characteristic read is to be requested, namely after initial service
@@ -119,14 +166,23 @@ static bool bt_scan_done = false;
 static void sensor_characteristic_reader() {
     // Read Temperature
     gl_profile_tab[PROFILE_A_APP_ID].char_handle = charac_handles[charac_pointer];
+    gl_profile_tab[PROFILE_A_APP_ID].uuid = charac_uuids[charac_pointer];
     ESP_LOGI(GATTC_TAG, "requesting characteristic %x", charac_handles[charac_pointer]);
     //esp_ble_gattc_register_for_notify (gattc_if, gl_profile_tab[PROFILE_A_APP_ID].remote_bda, char_elem_result[4].char_handle);
     
-    esp_gatt_status_t status = esp_ble_gattc_read_char(   
+    // Direct read
+    /* esp_gatt_status_t status = esp_ble_gattc_read_char(   
                                         gl_profile_tab[PROFILE_A_APP_ID].gattc_if, 
                                         gl_profile_tab[PROFILE_A_APP_ID].conn_id,
                                         gl_profile_tab[PROFILE_A_APP_ID].char_handle,
                                         ESP_GATT_AUTH_REQ_NONE);
+    */
+    // Request notifications
+    esp_gatt_status_t status = esp_ble_gattc_register_for_notify(   
+                                        gl_profile_tab[PROFILE_A_APP_ID].gattc_if,
+                                        gl_profile_tab[PROFILE_A_APP_ID].remote_bda,
+                                        gl_profile_tab[PROFILE_A_APP_ID].char_handle
+                                        );
     if (status != ESP_GATT_OK){
         ESP_LOGE(GATTC_TAG, "esp_ble_gattc_read_char error");
     }
@@ -228,6 +284,13 @@ static void gattc_profile_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_
                     for (uint8_t i=0; i<count; i++) {
                     //if (count > 0 && (char_elem_result[0].properties & ESP_GATT_CHAR_PROP_BIT_NOTIFY)){
                         ESP_LOGI(GATTC_TAG, "char: %d; char handle %x; props %x", i, char_elem_result[i].char_handle, char_elem_result[i].properties);
+                        esp_log_buffer_hex(GATTC_TAG, char_elem_result[i].uuid.uuid.uuid128, char_elem_result[i].uuid.len);
+                        for (uint8_t j=0; j<sizeof charac_handles; j++) {
+                            if (char_elem_result[i].char_handle == charac_handles[j]) {
+                                charac_uuids[j] = char_elem_result[i].uuid;
+                                ESP_LOGI(GATTC_TAG, "found handle %x", charac_handles[j]);
+                            }
+                        }
                     }
                     charac_pointer = 0;
                     sensor_characteristic_reader();
@@ -245,42 +308,53 @@ static void gattc_profile_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_
         if (p_data->reg_for_notify.status != ESP_GATT_OK){
             ESP_LOGE(GATTC_TAG, "REG FOR NOTIFY failed: error status = %d", p_data->reg_for_notify.status);
         }else{
-            ESP_LOGI(GATTC_TAG, " handle %x", gl_profile_tab[PROFILE_A_APP_ID].char_handle);
+            ESP_LOGI(GATTC_TAG, " handle %x; conn %d; if %d", gl_profile_tab[PROFILE_A_APP_ID].char_handle, gl_profile_tab[PROFILE_A_APP_ID].conn_id, gattc_if);
             uint16_t count = 0;
             uint16_t notify_en = 1;
-            esp_gatt_status_t ret_status = esp_ble_gattc_get_attr_count( gattc_if,
+            esp_gatt_status_t  ret_status = esp_ble_gattc_get_attr_count( gattc_if,
                                                                          gl_profile_tab[PROFILE_A_APP_ID].conn_id,
                                                                          ESP_GATT_DB_DESCRIPTOR,
-                                                                         gl_profile_tab[PROFILE_A_APP_ID].service_start_handle,
-                                                                         gl_profile_tab[PROFILE_A_APP_ID].service_end_handle,
+                                                                     /*   gl_profile_tab[PROFILE_A_APP_ID].service_start_handle,
+                                                                         gl_profile_tab[PROFILE_A_APP_ID].service_end_handle, */
+																		 0,
+																		 0,
                                                                          gl_profile_tab[PROFILE_A_APP_ID].char_handle,
                                                                          &count); 
+            
             //count = 1;
             if (ret_status != ESP_GATT_OK){
                 ESP_LOGE(GATTC_TAG, "esp_ble_gattc_get_attr_count error");
             }
+            
             ESP_LOGI(GATTC_TAG, "count %d; handle %x", count, gl_profile_tab[PROFILE_A_APP_ID].char_handle);
             esp_log_buffer_hex(GATTC_TAG, p_data->read.value, p_data->read.value_len);
+
             if (count > 0){
+                //count = 1;
+                esp_gatt_status_t ret_status;
                 descr_elem_result = malloc(sizeof(descr_elem_result) * count);
                 if (!descr_elem_result){
                     ESP_LOGE(GATTC_TAG, "malloc error, gattc no mem");
                 }else{
+                    ESP_LOGI(GATTC_TAG, "get_descr_by_char_handle  %x; status %d", p_data->reg_for_notify.handle, p_data->reg_for_notify.status);
+                    esp_log_buffer_hex(GATTC_TAG, &notify_descr_uuid.uuid, ESP_UUID_LEN_16);
                     ret_status = esp_ble_gattc_get_descr_by_char_handle( gattc_if,
                                                                          gl_profile_tab[PROFILE_A_APP_ID].conn_id,
                                                                          p_data->reg_for_notify.handle,
-                                                                         notify_descr_uuid,
+																		 notify_descr_uuid, // 0x2902
                                                                          descr_elem_result,
                                                                          &count);
                     if (ret_status != ESP_GATT_OK){
                         ESP_LOGE(GATTC_TAG, "esp_ble_gattc_get_descr_by_char_handle error");
                     }
+                    ESP_LOGI(GATTC_TAG, "get_descr uuid, count %d", count);
+                    //esp_log_buffer_hex(GATTC_TAG, descr_elem_result[0].uuid.uuid.uuid128, descr_elem_result[0].uuid.len); 
 
                     /* Every char have only one descriptor in our 'ESP_GATTS_DEMO' demo, so we used first 'descr_elem_result' */
-                    if (count > 0 && descr_elem_result[0].uuid.len == ESP_UUID_LEN_16 && descr_elem_result[0].uuid.uuid.uuid16 == ESP_GATT_UUID_CHAR_CLIENT_CONFIG){
+                    if (count > 0 && descr_elem_result[0].uuid.len == ESP_UUID_LEN_16 && descr_elem_result[0].uuid.uuid.uuid16 == ESP_GATT_UUID_CHAR_CLIENT_CONFIG) {
                         ret_status = esp_ble_gattc_write_char_descr( gattc_if,
                                                                      gl_profile_tab[PROFILE_A_APP_ID].conn_id,
-                                                                     descr_elem_result[0].handle,
+                                                                     gl_profile_tab[PROFILE_A_APP_ID].char_handle,
                                                                      sizeof(notify_en),
                                                                      (uint8_t *)&notify_en,
                                                                      ESP_GATT_WRITE_TYPE_RSP,
@@ -298,13 +372,15 @@ static void gattc_profile_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_
             else{
                 ESP_LOGE(GATTC_TAG, "descr not found");
             }
-
         }
         break;
     }
     case ESP_GATTC_NOTIFY_EVT:
-        ESP_LOGI(GATTC_TAG, "ESP_GATTC_NOTIFY_EVT, receive notify value:");
+        ESP_LOGI(GATTC_TAG, "ESP_GATTC_NOTIFY_EVT, receive notify value for handle %x:", p_data->notify.handle);
         esp_log_buffer_hex(GATTC_TAG, p_data->notify.value, p_data->notify.value_len);
+        // Request the next value.
+        sensor_characteristic_reader();
+
         break;
     case ESP_GATTC_WRITE_DESCR_EVT:
         if (p_data->write.status != ESP_GATT_OK){
@@ -312,7 +388,7 @@ static void gattc_profile_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_
             break;
         }
         ESP_LOGI(GATTC_TAG, "write descr success ");
-        uint8_t write_char_data[35];
+        /*uint8_t write_char_data[35];
         for (int i = 0; i < sizeof(write_char_data); ++i)
         {
             write_char_data[i] = i % 256;
@@ -324,6 +400,7 @@ static void gattc_profile_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_
                                   write_char_data,
                                   ESP_GATT_WRITE_TYPE_RSP,
                                   ESP_GATT_AUTH_REQ_NONE);
+        */
         break;
     case ESP_GATTC_SRVC_CHG_EVT: {
         esp_bd_addr_t bda;
@@ -346,17 +423,17 @@ static void gattc_profile_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_
         break;
     case ESP_GATTC_READ_CHAR_EVT:
         ESP_LOGI(GATTC_TAG, "ESP_GATTC_READ_CHAR_EVT, status = %d, len=%d, handle %x", p_data->read.status, p_data->read.value_len, gl_profile_tab[PROFILE_A_APP_ID].char_handle);
-        if (gl_profile_tab[PROFILE_A_APP_ID].char_handle == 0x11) { // Temperature
+        if (gl_profile_tab[PROFILE_A_APP_ID].char_handle == 0x15) { // Temperature
             uint8_t valint;
-            memcpy(&valint, p_data->read.value, 1);
+            memcpy(&valint, p_data->read.value, 2);
             float temp = valint/10.0f;
             ESP_LOGI(GATTC_TAG, "ESP_GATTC_READ_CHAR_EVT, Temperature = %.1f", temp);
-        }else if (gl_profile_tab[PROFILE_A_APP_ID].char_handle == 0x17) { // Pressure
+        }else if (gl_profile_tab[PROFILE_A_APP_ID].char_handle == 0x11) { // Pressure
             //uint8_t valint;
             //memcpy(&valint, p_data->read.value, 1);
             //float temp = valint/10.0f;
             //ESP_LOGI(GATTC_TAG, "ESP_GATTC_READ_CHAR_EVT, Temperature = %.1f", temp);
-            esp_log_buffer_hex("ESP_GATTC_READ_CHAR_EVT barometer ", p_data->read.value, 4);
+            esp_log_buffer_hex("ESP_GATTC_READ_CHAR_EVT barometer ", p_data->read.value, 4); // big endian!
         } else {
             esp_log_buffer_hex("ESP_GATTC_READ_CHAR_EVT", p_data->read.value, p_data->read.value_len);
         }
@@ -405,17 +482,19 @@ static void esp_gap_cb(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *par
                                                                                            scan_result->scan_rst.rssi);
             adv_name = esp_ble_resolve_adv_data(scan_result->scan_rst.ble_adv,
                                                 ESP_BLE_AD_TYPE_NAME_CMPL, &adv_name_len);
-            ESP_LOGI(GATTC_TAG, "searched Device Name Len %d", adv_name_len);
+            //ESP_LOGI(GATTC_TAG, "searched Device Name Len %d", adv_name_len);
             esp_log_buffer_char(GATTC_TAG, adv_name, adv_name_len);
             ESP_LOGI(GATTC_TAG, "\n");
             if (adv_name != NULL) {
                 if (strlen(remote_device_name) == adv_name_len && strncmp((char *)adv_name, remote_device_name, adv_name_len) == 0) {
                     ESP_LOGI(GATTC_TAG, "searched device %s\n", remote_device_name);
+                    sensorRssi = scan_result->scan_rst.rssi;
+                    sensorFound = true;
                     if (connect == false) {
                         connect = true;
                         ESP_LOGI(GATTC_TAG, "connect to the remote device.");
                         esp_ble_gap_stop_scanning();
-                        esp_ble_gattc_open(gl_profile_tab[PROFILE_A_APP_ID].gattc_if, scan_result->scan_rst.bda, true);
+                        //esp_ble_gattc_open(gl_profile_tab[PROFILE_A_APP_ID].gattc_if, scan_result->scan_rst.bda, true);
                     }
                 }
             }
@@ -444,7 +523,7 @@ static void esp_gap_cb(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *par
         ESP_LOGI(GATTC_TAG, "stop adv successfully");
         break;
     case ESP_GAP_BLE_UPDATE_CONN_PARAMS_EVT:
-         ESP_LOGI(GATTC_TAG, "update connetion params status = %d, min_int = %d, max_int = %d,conn_int = %d,latency = %d, timeout = %d",
+         ESP_LOGI(GATTC_TAG, "update connection params status = %d, min_int = %d, max_int = %d,conn_int = %d,latency = %d, timeout = %d",
                   param->update_conn_params.status,
                   param->update_conn_params.min_int,
                   param->update_conn_params.max_int,
@@ -486,6 +565,242 @@ static void esp_gattc_cb(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_if, esp
     } while (0);
 }
 
+// *******************************************************
+// Wifi event handler
+
+static esp_err_t event_handler(void *ctx, system_event_t *event)
+{
+    switch(event->event_id) {
+
+    case SYSTEM_EVENT_STA_START:
+    	printf("Event STA start\n");
+        ESP_ERROR_CHECK(esp_wifi_connect());
+    	printf("Wifi connect done.\n");
+        break;
+
+	case SYSTEM_EVENT_STA_GOT_IP:
+    	printf("Event got IP\n");
+        xEventGroupSetBits(event_group, WIFI_CONNECTED_BIT);
+        break;
+
+	case SYSTEM_EVENT_STA_DISCONNECTED:
+		xEventGroupClearBits(event_group, WIFI_CONNECTED_BIT);
+        break;
+
+	default:
+        break;
+    }
+	return ESP_OK;
+}
+
+
+static void http_server_netconn_serve(struct netconn *conn) {
+
+	struct netbuf *inbuf;
+	char *buf;
+	u16_t buflen;
+	err_t err;
+
+	err = netconn_recv(conn, &inbuf);
+
+	if (err == ERR_OK) {
+
+		netbuf_data(inbuf, (void**)&buf, &buflen);
+
+		// extract the first line, with the request
+		char *first_line = strtok(buf, "\n");
+
+		if(first_line) {
+
+			char rssi[10];
+			sprintf(rssi, "%d", sensorRssi);
+
+			int pir = gpio_get_level(CONFIG_PIR_PIN);
+
+			// default page
+			if(strstr(first_line, "GET / ")) {
+				netconn_write(conn, http_html_hdr, sizeof(http_html_hdr) - 1, NETCONN_NOCOPY);
+				netconn_write(conn, http_page_hdr, sizeof(http_page_hdr) - 1, NETCONN_NOCOPY);
+				//if(relay_status) {
+					printf("Sending default page\n");
+					//netconn_write(conn, http_on_hml, sizeof(http_on_hml) - 1, NETCONN_NOCOPY);
+					char buffer[100];
+					uint8_t n;
+					n = sprintf(buffer, &http_page_body, (sensorFound ? "is" : "is not"), remote_device_name, rssi, pir);
+					netconn_write(conn, buffer, n, NETCONN_NOCOPY);
+
+
+				//}
+				//else {
+				//	printf("Sending default page, relay is OFF\n");
+				//	netconn_write(conn, http_off_hml, sizeof(http_off_hml) - 1, NETCONN_NOCOPY);
+				//}
+			}
+
+			// ON page
+			else if(strstr(first_line, "GET /on.html ")) {
+
+				if(relay_status == false) {
+					printf("Turning relay ON\n");
+					//gpio_set_level(CONFIG_PIR_PIN, 1);
+					relay_status = true;
+				}
+
+				printf("Sending OFF page...\n");
+				netconn_write(conn, http_html_hdr, sizeof(http_html_hdr) - 1, NETCONN_NOCOPY);
+				//netconn_write(conn, http_on_hml, sizeof(http_on_hml) - 1, NETCONN_NOCOPY);
+				char buffer[50];
+				uint8_t n;
+				n = sprintf(buffer, &http_page_body, (sensorFound ? "is" : "is not"), remote_device_name, rssi, pir);
+				netconn_write(conn, buffer, n, NETCONN_NOCOPY);
+			}
+
+			// OFF page
+			else if(strstr(first_line, "GET /off.html ")) {
+
+				if(relay_status == true) {
+					printf("Turning relay OFF\n");
+					//gpio_set_level(CONFIG_PIR_PIN, 0);
+					relay_status = false;
+				}
+
+				printf("Sending OFF page...\n");
+				netconn_write(conn, http_html_hdr, sizeof(http_html_hdr) - 1, NETCONN_NOCOPY);
+				netconn_write(conn, http_page_body, sizeof(http_page_body) - 1, NETCONN_NOCOPY);
+			}
+
+			// ON image
+			else if(strstr(first_line, "GET /on.png ")) {
+				printf("Sending ON image...\n");
+				netconn_write(conn, http_png_hdr, sizeof(http_png_hdr) - 1, NETCONN_NOCOPY);
+				netconn_write(conn, on_png_start, on_png_end - on_png_start, NETCONN_NOCOPY);
+			}
+
+			// OFF image
+			else if(strstr(first_line, "GET /off.png ")) {
+				printf("Sending OFF image...\n");
+				netconn_write(conn, http_png_hdr, sizeof(http_png_hdr) - 1, NETCONN_NOCOPY);
+				netconn_write(conn, off_png_start, off_png_end - off_png_start, NETCONN_NOCOPY);
+			}
+
+			else printf("Unknown request: %s\n", first_line);
+		}
+		else printf("Unknown request\n");
+	}
+
+	// close the connection and free the buffer
+	netconn_close(conn);
+	netbuf_delete(inbuf);
+}
+
+static void http_server(void *pvParameters) {
+
+	struct netconn *conn, *newconn;
+	err_t err;
+	conn = netconn_new(NETCONN_TCP);
+	netconn_bind(conn, NULL, 80);
+	//netconn_bind(conn, hostAddr, 80);
+	netconn_listen(conn);
+	printf("HTTP Server listening...\n");
+	do {
+		// this command blocks
+		err = netconn_accept(conn, &newconn);
+		printf("New client connected\n");
+		if (err == ERR_OK) {
+			http_server_netconn_serve(newconn);
+			netconn_delete(newconn);
+		}
+	} while(err == ERR_OK);
+	netconn_close(conn);
+	netconn_delete(conn);
+	printf("\n");
+}
+
+
+// setup and start the wifi connection
+void wifi_setup() {
+
+	event_group = xEventGroupCreate();
+	printf("event Group Created\n");
+
+	tcpip_adapter_init();
+	printf("TCP/IP adapter inited\n");
+
+	ESP_ERROR_CHECK(esp_event_loop_init(event_handler, NULL));
+
+	wifi_init_config_t wifi_init_config = WIFI_INIT_CONFIG_DEFAULT();
+	printf("wifi config inited\n");
+	ESP_ERROR_CHECK(esp_wifi_init(&wifi_init_config));
+	ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
+	ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+
+	printf("ssid %s\n", CONFIG_WIFI_SSID);
+	wifi_config_t wifi_config = {
+        .sta = {
+            .ssid = CONFIG_WIFI_SSID,
+            .password = CONFIG_WIFI_PASSWORD,
+        },
+    };
+	printf("setting wifi config\n");
+	ESP_ERROR_CHECK(esp_wifi_set_config(ESP_IF_WIFI_STA, &wifi_config));
+    ESP_ERROR_CHECK(esp_wifi_start());
+	printf("wifi setup exit\n");
+}
+
+
+// configure the output PIN
+void gpio_setup() {
+
+	// configure the pit pin as GPIO, output
+	gpio_pad_select_gpio(CONFIG_PIR_PIN);
+    gpio_set_direction(CONFIG_PIR_PIN, GPIO_MODE_INPUT);
+
+	// set initial status = OFF
+	//gpio_set_level(CONFIG_PIR_PIN, 0);
+	relay_status = false;
+}
+
+// ****************************************************
+
+void init_wifi()
+{
+	// disable the default wifi logging
+	esp_log_level_set("wifi", ESP_LOG_NONE);
+
+	//nvs_flash_init();
+	wifi_setup();
+
+	// wait for connection
+	printf("Waiting for connection to the wifi network...\n ");
+	EventBits_t resultBits = xEventGroupWaitBits(event_group, WIFI_CONNECTED_BIT, pdFALSE, pdTRUE, portMAX_DELAY);
+	if (resultBits & WIFI_CONNECTED_BIT) {
+		printf("Connected\n\n");
+	} else {
+		printf("Wifi timed out waiting for connection\n\n");
+	}
+
+	// print the local IP address
+	tcpip_adapter_ip_info_t ip_info;
+	ESP_ERROR_CHECK(tcpip_adapter_get_ip_info(TCPIP_ADAPTER_IF_STA, &ip_info));
+	printf("IP Address:  %s\n", ip4addr_ntoa(&ip_info.ip));
+	printf("Subnet mask: %s\n", ip4addr_ntoa(&ip_info.netmask));
+	printf("Gateway:     %s\n", ip4addr_ntoa(&ip_info.gw));
+	//hostAddr = &ip_info.ip;
+
+	gpio_setup();
+
+	// run the mDNS daemon
+	mdns_server_t* mDNS = NULL;
+	ESP_ERROR_CHECK(mdns_init(TCPIP_ADAPTER_IF_STA, &mDNS));
+	ESP_ERROR_CHECK(mdns_set_hostname(mDNS, "esp32"));
+	ESP_ERROR_CHECK(mdns_set_instance(mDNS, "Basic HTTP Server"));
+	printf("mDNS started\n");
+
+	// start the HTTP Server task
+    xTaskCreate(&http_server, "http_server", 2048, NULL, 5, NULL);
+	//http_server();
+}
+
 void app_main()
 {
     // Initialize NVS.
@@ -495,6 +810,10 @@ void app_main()
         ret = nvs_flash_init();
     }
     ESP_ERROR_CHECK( ret );
+
+	// Connect to wifi router
+	init_wifi();
+
 
     esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
     ret = esp_bt_controller_init(&bt_cfg);
