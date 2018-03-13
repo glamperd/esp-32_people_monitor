@@ -48,3 +48,11 @@ Temporary Items
 
 # build folder
 build/
+sdkconfig
+main/Kconfig2.usyd.projbuildxx
+*.projbuildxx
+main/Kconfig.projbuild
+sdkconfig
+sdkconfig.old
+sdkconfig
+sdkconfig.old
