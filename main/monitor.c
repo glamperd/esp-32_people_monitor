@@ -72,7 +72,7 @@
 
 //static const char *TAG = "MQTT_SAMPLE";
 
-static EventGroupHandle_t wifi_event_group;
+//static EventGroupHandle_t wifi_event_group;
 const static int CONNECTED_BIT = BIT0;
 
 static const esp_gatt_auth_req_t gattc_auth_request_none = ESP_GATT_AUTH_REQ_NONE;
@@ -96,7 +96,7 @@ static void gattc_profile_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_
 // MQTT globals
 static bool mqtt_is_connected = false;
 static esp_mqtt_client_handle_t mqtt_client;
-static const char mqtt_topic_bt_info = "/epm/bt";
+static const char mqtt_topic_bt_info[] = "/epm/bt";
 
 /* static esp_bt_uuid_t remote_filter_service_uuid = {
     .len = ESP_UUID_LEN_128,
@@ -175,19 +175,19 @@ bool sensorFound = false;
 
 static esp_err_t mqtt_event_handler(esp_mqtt_event_handle_t event)
 {
-    esp_mqtt_client_handle_t client = event->client;
+    mqtt_client = event->client;
     int msg_id;
     // your_context_t *context = event->context;
     switch (event->event_id) {
         case MQTT_EVENT_CONNECTED:
             ESP_LOGI(TAG, "MQTT_EVENT_CONNECTED");
-            msg_id = esp_mqtt_client_subscribe(client, mqtt_topic_bt_info, 0);
+            msg_id = esp_mqtt_client_subscribe(mqtt_client, mqtt_topic_bt_info, 0);
             ESP_LOGI(TAG, "sent subscribe successful, msg_id=%d", msg_id);
 
-            msg_id = esp_mqtt_client_subscribe(client, "/topic/qos1", 1);
+            msg_id = esp_mqtt_client_subscribe(mqtt_client, "/topic/qos1", 1);
             ESP_LOGI(TAG, "sent subscribe successful, msg_id=%d", msg_id);
 
-            msg_id = esp_mqtt_client_unsubscribe(client, "/topic/qos1");
+            msg_id = esp_mqtt_client_unsubscribe(mqtt_client, "/topic/qos1");
             ESP_LOGI(TAG, "sent unsubscribe successful, msg_id=%d", msg_id);
             break;
         case MQTT_EVENT_DISCONNECTED:
@@ -561,7 +561,8 @@ static void esp_gap_cb(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *par
 				//ESP_LOGI(GATTC_TAG, "\n");
 				if (adv_name != NULL) {
 					// Send device name
-					msg_id = esp_mqtt_client_publish(mqtt_client, mqtt_topic_bt_info, adv_name, 0, 0, 0);
+					sprintf(tempstr, "adv name: %s", adv_name);
+					msg_id = esp_mqtt_client_publish(mqtt_client, mqtt_topic_bt_info, tempstr, 0, 0, 0);
 					if (strlen(remote_device_name) == adv_name_len && strncmp((char *)adv_name, remote_device_name, adv_name_len) == 0) {
 						ESP_LOGI(GATTC_TAG, "searched device %s\n", remote_device_name);
 						sensorRssi = scan_result->scan_rst.rssi;
@@ -668,129 +669,6 @@ static esp_err_t event_handler(void *ctx, system_event_t *event)
         break;
     }
 	return ESP_OK;
-}
-
-
-static void http_server_netconn_serve(struct netconn *conn) {
-
-	struct netbuf *inbuf;
-	char *buf;
-	u16_t buflen;
-	err_t err;
-
-	err = netconn_recv(conn, &inbuf);
-
-	if (err == ERR_OK) {
-
-		netbuf_data(inbuf, (void**)&buf, &buflen);
-
-		// extract the first line, with the request
-		char *first_line = strtok(buf, "\n");
-
-		if(first_line) {
-
-			char rssi[10];
-			sprintf(rssi, "%d", sensorRssi);
-
-			int pir = gpio_get_level(CONFIG_PIR_PIN);
-
-			// default page
-			if(strstr(first_line, "GET / ")) {
-				netconn_write(conn, http_html_hdr, sizeof(http_html_hdr) - 1, NETCONN_NOCOPY);
-				netconn_write(conn, http_page_hdr, sizeof(http_page_hdr) - 1, NETCONN_NOCOPY);
-				//if(relay_status) {
-					printf("Sending default page\n");
-					//netconn_write(conn, http_on_hml, sizeof(http_on_hml) - 1, NETCONN_NOCOPY);
-					char buffer[100];
-					uint8_t n;
-					n = sprintf(buffer, &http_page_body, (sensorFound ? "is" : "is not"), remote_device_name, rssi, pir);
-					netconn_write(conn, buffer, n, NETCONN_NOCOPY);
-
-
-				//}
-				//else {
-				//	printf("Sending default page, relay is OFF\n");
-				//	netconn_write(conn, http_off_hml, sizeof(http_off_hml) - 1, NETCONN_NOCOPY);
-				//}
-			}
-
-			// ON page
-			else if(strstr(first_line, "GET /on.html ")) {
-
-				if(relay_status == false) {
-					printf("Turning relay ON\n");
-					//gpio_set_level(CONFIG_PIR_PIN, 1);
-					relay_status = true;
-				}
-
-				printf("Sending OFF page...\n");
-				netconn_write(conn, http_html_hdr, sizeof(http_html_hdr) - 1, NETCONN_NOCOPY);
-				//netconn_write(conn, http_on_hml, sizeof(http_on_hml) - 1, NETCONN_NOCOPY);
-				char buffer[50];
-				uint8_t n;
-				n = sprintf(buffer, &http_page_body, (sensorFound ? "is" : "is not"), remote_device_name, rssi, pir);
-				netconn_write(conn, buffer, n, NETCONN_NOCOPY);
-			}
-
-			// OFF page
-			else if(strstr(first_line, "GET /off.html ")) {
-
-				if(relay_status == true) {
-					printf("Turning relay OFF\n");
-					//gpio_set_level(CONFIG_PIR_PIN, 0);
-					relay_status = false;
-				}
-
-				printf("Sending OFF page...\n");
-				netconn_write(conn, http_html_hdr, sizeof(http_html_hdr) - 1, NETCONN_NOCOPY);
-				netconn_write(conn, http_page_body, sizeof(http_page_body) - 1, NETCONN_NOCOPY);
-			}
-
-			// ON image
-			else if(strstr(first_line, "GET /on.png ")) {
-				printf("Sending ON image...\n");
-				netconn_write(conn, http_png_hdr, sizeof(http_png_hdr) - 1, NETCONN_NOCOPY);
-				netconn_write(conn, on_png_start, on_png_end - on_png_start, NETCONN_NOCOPY);
-			}
-
-			// OFF image
-			else if(strstr(first_line, "GET /off.png ")) {
-				printf("Sending OFF image...\n");
-				netconn_write(conn, http_png_hdr, sizeof(http_png_hdr) - 1, NETCONN_NOCOPY);
-				netconn_write(conn, off_png_start, off_png_end - off_png_start, NETCONN_NOCOPY);
-			}
-
-			else printf("Unknown request: %s\n", first_line);
-		}
-		else printf("Unknown request\n");
-	}
-
-	// close the connection and free the buffer
-	netconn_close(conn);
-	netbuf_delete(inbuf);
-}
-
-static void http_server(void *pvParameters) {
-
-	struct netconn *conn, *newconn;
-	err_t err;
-	conn = netconn_new(NETCONN_TCP);
-	netconn_bind(conn, NULL, 80);
-	//netconn_bind(conn, hostAddr, 80);
-	netconn_listen(conn);
-	printf("HTTP Server listening...\n");
-	do {
-		// this command blocks
-		err = netconn_accept(conn, &newconn);
-		printf("New client connected\n");
-		if (err == ERR_OK) {
-			http_server_netconn_serve(newconn);
-			netconn_delete(newconn);
-		}
-	} while(err == ERR_OK);
-	netconn_close(conn);
-	netconn_delete(conn);
-	printf("\n");
 }
 
 
