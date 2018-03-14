@@ -77,7 +77,7 @@ const static int CONNECTED_BIT = BIT0;
 
 static const esp_gatt_auth_req_t gattc_auth_request_none = ESP_GATT_AUTH_REQ_NONE;
 
-static const char remote_device_name[] = "SENSOR";
+static const char remote_device_name[] = "ID107 HR"; // "SENSOR";
 static const uint8_t service_id[] = {0x6E, 0x40, 0x00, 0x01, 0xB5, 0xA3, 0xF3, 0x93, 0xE0, 0xA9, 0xE5, 0x0E, 0x24, 0xDC, 0xCA, 0x9E}; // needs to be reversed
 static bool connect    = false;
 static bool get_server = false;
@@ -92,6 +92,11 @@ static int charac_pointer = 0;
 static void esp_gap_cb(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *param);
 static void esp_gattc_cb(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_if, esp_ble_gattc_cb_param_t *param);
 static void gattc_profile_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_if, esp_ble_gattc_cb_param_t *param);
+
+// MQTT globals
+static bool mqtt_is_connected = false;
+static esp_mqtt_client_handle_t mqtt_client;
+static const char mqtt_topic_bt_info = "/epm/bt";
 
 /* static esp_bt_uuid_t remote_filter_service_uuid = {
     .len = ESP_UUID_LEN_128,
@@ -176,7 +181,7 @@ static esp_err_t mqtt_event_handler(esp_mqtt_event_handle_t event)
     switch (event->event_id) {
         case MQTT_EVENT_CONNECTED:
             ESP_LOGI(TAG, "MQTT_EVENT_CONNECTED");
-            msg_id = esp_mqtt_client_subscribe(client, "/topic/qos0", 0);
+            msg_id = esp_mqtt_client_subscribe(client, mqtt_topic_bt_info, 0);
             ESP_LOGI(TAG, "sent subscribe successful, msg_id=%d", msg_id);
 
             msg_id = esp_mqtt_client_subscribe(client, "/topic/qos1", 1);
@@ -191,11 +196,13 @@ static esp_err_t mqtt_event_handler(esp_mqtt_event_handle_t event)
 
         case MQTT_EVENT_SUBSCRIBED:
             ESP_LOGI(TAG, "MQTT_EVENT_SUBSCRIBED, msg_id=%d", event->msg_id);
-            msg_id = esp_mqtt_client_publish(client, "/topic/qos0", "data", 0, 0, 0);
-            ESP_LOGI(TAG, "sent publish successful, msg_id=%d", msg_id);
+            mqtt_is_connected = true;
+            //msg_id = esp_mqtt_client_publish(client, mqtt_topic_bt_info, "data", 0, 0, 0);
+            //ESP_LOGI(TAG, "sent publish successful, msg_id=%d", msg_id);
             break;
         case MQTT_EVENT_UNSUBSCRIBED:
             ESP_LOGI(TAG, "MQTT_EVENT_UNSUBSCRIBED, msg_id=%d", event->msg_id);
+            mqtt_is_connected = false;
             break;
         case MQTT_EVENT_PUBLISHED:
             ESP_LOGI(TAG, "MQTT_EVENT_PUBLISHED, msg_id=%d", event->msg_id);
@@ -532,27 +539,41 @@ static void esp_gap_cb(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *par
         esp_ble_gap_cb_param_t *scan_result = (esp_ble_gap_cb_param_t *)param;
         switch (scan_result->scan_rst.search_evt) {
         case ESP_GAP_SEARCH_INQ_RES_EVT:
-            esp_log_buffer_hex(GATTC_TAG, scan_result->scan_rst.bda, 6);
-            ESP_LOGI(GATTC_TAG, "searched Adv Data Len %d, Scan Response Len %d, rssi %d", scan_result->scan_rst.adv_data_len, 
-                                                                                           scan_result->scan_rst.scan_rsp_len,
-                                                                                           scan_result->scan_rst.rssi);
-            adv_name = esp_ble_resolve_adv_data(scan_result->scan_rst.ble_adv,
-                                                ESP_BLE_AD_TYPE_NAME_CMPL, &adv_name_len);
-            //ESP_LOGI(GATTC_TAG, "searched Device Name Len %d", adv_name_len);
-            esp_log_buffer_char(GATTC_TAG, adv_name, adv_name_len);
-            ESP_LOGI(GATTC_TAG, "\n");
-            if (adv_name != NULL) {
-                if (strlen(remote_device_name) == adv_name_len && strncmp((char *)adv_name, remote_device_name, adv_name_len) == 0) {
-                    ESP_LOGI(GATTC_TAG, "searched device %s\n", remote_device_name);
-                    sensorRssi = scan_result->scan_rst.rssi;
-                    sensorFound = true;
-                    if (connect == false) {
-                        connect = true;
-                        ESP_LOGI(GATTC_TAG, "connect to the remote device.");
-                        esp_ble_gap_stop_scanning();
-                        //esp_ble_gattc_open(gl_profile_tab[PROFILE_A_APP_ID].gattc_if, scan_result->scan_rst.bda, true);
-                    }
-                }
+            //esp_log_buffer_hex(GATTC_TAG, scan_result->scan_rst.bda, 6);
+            //ESP_LOGI(GATTC_TAG, "searched Adv Data Len %d, Scan Response Len %d, rssi %d", scan_result->scan_rst.adv_data_len,
+            //                                                                               scan_result->scan_rst.scan_rsp_len,
+            //                                                                               scan_result->scan_rst.rssi);
+            // Send data via MQTT
+            if (mqtt_is_connected) {
+            	// Send RSSI data
+    			char tempstr[100];
+            	sprintf(tempstr, "Advertised Data len %d, Scan Response Len %d, rssi %d",
+            			scan_result->scan_rst.adv_data_len,
+						scan_result->scan_rst.scan_rsp_len,
+						scan_result->scan_rst.rssi );
+				int msg_id = esp_mqtt_client_publish(mqtt_client, mqtt_topic_bt_info, tempstr, 0, 0, 0);
+				ESP_LOGI(TAG, "sent publish successful, msg_id=%d", msg_id);
+
+				adv_name = esp_ble_resolve_adv_data(scan_result->scan_rst.ble_adv,
+												ESP_BLE_AD_TYPE_NAME_CMPL, &adv_name_len);
+				//ESP_LOGI(GATTC_TAG, "searched Device Name Len %d", adv_name_len);
+				//esp_log_buffer_char(GATTC_TAG, adv_name, adv_name_len);
+				//ESP_LOGI(GATTC_TAG, "\n");
+				if (adv_name != NULL) {
+					// Send device name
+					msg_id = esp_mqtt_client_publish(mqtt_client, mqtt_topic_bt_info, adv_name, 0, 0, 0);
+					if (strlen(remote_device_name) == adv_name_len && strncmp((char *)adv_name, remote_device_name, adv_name_len) == 0) {
+						ESP_LOGI(GATTC_TAG, "searched device %s\n", remote_device_name);
+						sensorRssi = scan_result->scan_rst.rssi;
+						sensorFound = true;
+						if (connect == false) {
+							connect = true;
+							ESP_LOGI(GATTC_TAG, "connect to the remote device.");
+							esp_ble_gap_stop_scanning();
+							//esp_ble_gattc_open(gl_profile_tab[PROFILE_A_APP_ID].gattc_if, scan_result->scan_rst.bda, true);
+						}
+					}
+				}
             }
             break;
         case ESP_GAP_SEARCH_INQ_CMPL_EVT:
@@ -853,7 +874,7 @@ void init_wifi()
 	printf("mDNS started\n");
 
 	// start the HTTP Server task
-    xTaskCreate(&http_server, "http_server", 2048, NULL, 5, NULL);
+    //xTaskCreate(&http_server, "http_server", 2048, NULL, 5, NULL);
 	//http_server();
 }
 
