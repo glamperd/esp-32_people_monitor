@@ -61,6 +61,7 @@
 #include "lwip/api.h"
 #include "lwip/err.h"
 #include "lwip/netdb.h"
+#include "cJSON.h"
 
 
 #define GATTC_TAG "SENSOR_READ"
@@ -97,6 +98,12 @@ static void gattc_profile_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_
 static bool mqtt_is_connected = false;
 static esp_mqtt_client_handle_t mqtt_client;
 static const char mqtt_topic_bt_info[] = "/epm/bt";
+static cJSON *status_message;
+static const char my_id[] = "014a7d3bf12568"; // TODO this needs to be a MAC address or something
+
+// PIR sensor globals
+static const gpio_num_t PIR_SIGNAL_PIN = GPIO_NUM_18;
+static const uint64_t PIR_SIGNAL_MASK = GPIO_SEL_18;
 
 /* static esp_bt_uuid_t remote_filter_service_uuid = {
     .len = ESP_UUID_LEN_128,
@@ -145,20 +152,7 @@ static struct gattc_profile_inst gl_profile_tab[PROFILE_NUM] = {
 static bool bt_scan_done = false;
 
 //*********************************************
-// web server variables
 
-// HTTP headers and web pages
-const static char http_html_hdr[] = "HTTP/1.1 200 OK\nContent-type: text/html\n\n";
-const static char http_png_hdr[] = "HTTP/1.1 200 OK\nContent-type: image/png\n\n";
-const static char http_page_hdr[] = "<meta content=\"width=device-width,initial-scale=1\"name=viewport><style>div{width:230px;height:300px;position:absolute;top:0;bottom:0;left:0;right:0;margin:auto}</style>";
-const static char http_page_body[] = "<div><h1 align=center>Sensor %s detected</h1><p>%s RSSI is: %s<p>Human detected: %d</div>";
-const static char http_on_hml[] = "<div><h1 align=center>Relay is ON</h1><a href=off.html><img src=off.png></a></div>";
-
-// embedded binary data
-extern const uint8_t on_png_start[] asm("_binary_on_png_start");
-extern const uint8_t on_png_end[]   asm("_binary_on_png_end");
-extern const uint8_t off_png_start[] asm("_binary_off_png_start");
-extern const uint8_t off_png_end[]   asm("_binary_off_png_end");
 
 
 // Event group for inter-task communication
@@ -517,7 +511,7 @@ static void gattc_profile_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_
 
 static void esp_gap_cb(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *param)
 {
-    uint8_t *adv_name = NULL;
+    unsigned char *adv_name = NULL;
     uint8_t adv_name_len = 0;
     switch (event) {
     case ESP_GAP_BLE_SCAN_PARAM_SET_COMPLETE_EVT: {
@@ -546,23 +540,32 @@ static void esp_gap_cb(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *par
             // Send data via MQTT
             if (mqtt_is_connected) {
             	// Send RSSI data
-    			char tempstr[100];
-            	sprintf(tempstr, "Advertised Data len %d, Scan Response Len %d, rssi %d",
-            			scan_result->scan_rst.adv_data_len,
-						scan_result->scan_rst.scan_rsp_len,
-						scan_result->scan_rst.rssi );
-				int msg_id = esp_mqtt_client_publish(mqtt_client, mqtt_topic_bt_info, tempstr, 0, 0, 0);
+            	// Create cJSON object
+				adv_name = (unsigned char *)esp_ble_resolve_adv_data(scan_result->scan_rst.ble_adv,
+												ESP_BLE_AD_TYPE_NAME_CMPL, &adv_name_len);
+
+
+				cJSON_AddStringToObject(status_message, "name", my_id);
+    			cJSON_AddNumberToObject(status_message, "rssi", scan_result->scan_rst.rssi);
+    			cJSON_AddNumberToObject(status_message, "adv_name_len", adv_name_len);
+    			if (adv_name == NULL) {
+        			cJSON_AddStringToObject(status_message, "sensor", "unknown");
+    			} else {
+    				adv_name[adv_name_len] = 0; // Remove crap after the name
+        			cJSON_AddStringToObject(status_message, "sensor", (char *)adv_name);
+    			}
+            	//sprintf(tempstr, "Advertised Data len %d, Scan Response Len %d, rssi %d",
+            	//		scan_result->scan_rst.adv_data_len,
+				//		scan_result->scan_rst.scan_rsp_len,
+				//		scan_result->scan_rst.rssi );
+    			char *temp = cJSON_Print(status_message);
+				int msg_id = esp_mqtt_client_publish(mqtt_client, mqtt_topic_bt_info, temp, 0, 0, 0);
 				ESP_LOGI(TAG, "sent publish successful, msg_id=%d", msg_id);
 
-				adv_name = esp_ble_resolve_adv_data(scan_result->scan_rst.ble_adv,
-												ESP_BLE_AD_TYPE_NAME_CMPL, &adv_name_len);
-				//ESP_LOGI(GATTC_TAG, "searched Device Name Len %d", adv_name_len);
-				//esp_log_buffer_char(GATTC_TAG, adv_name, adv_name_len);
-				//ESP_LOGI(GATTC_TAG, "\n");
 				if (adv_name != NULL) {
 					// Send device name
-					sprintf(tempstr, "adv name: %s", adv_name);
-					msg_id = esp_mqtt_client_publish(mqtt_client, mqtt_topic_bt_info, tempstr, 0, 0, 0);
+					//sprintf(tempstr, "adv name: %s", adv_name);
+					//msg_id = esp_mqtt_client_publish(mqtt_client, mqtt_topic_bt_info, tempstr, 0, 0, 0);
 					if (strlen(remote_device_name) == adv_name_len && strncmp((char *)adv_name, remote_device_name, adv_name_len) == 0) {
 						ESP_LOGI(GATTC_TAG, "searched device %s\n", remote_device_name);
 						sensorRssi = scan_result->scan_rst.rssi;
@@ -703,17 +706,6 @@ void wifi_setup() {
 }
 
 
-// configure the output PIN
-void gpio_setup() {
-
-	// configure the pit pin as GPIO, output
-	gpio_pad_select_gpio(CONFIG_PIR_PIN);
-    gpio_set_direction(CONFIG_PIR_PIN, GPIO_MODE_INPUT);
-
-	// set initial status = OFF
-	//gpio_set_level(CONFIG_PIR_PIN, 0);
-	relay_status = false;
-}
 
 // ****************************************************
 
@@ -742,7 +734,6 @@ void init_wifi()
 	printf("Gateway:     %s\n", ip4addr_ntoa(&ip_info.gw));
 	//hostAddr = &ip_info.ip;
 
-	gpio_setup();
 
 	// run the mDNS daemon
 	mdns_server_t* mDNS = NULL;
@@ -758,6 +749,7 @@ void init_wifi()
 
 static void mqtt_app_start(void)
 {
+	status_message = cJSON_CreateObject();
     const esp_mqtt_client_config_t mqtt_cfg = {
         .uri = "mqtt://iot.eclipse.org",
         .event_handle = mqtt_event_handler,
@@ -766,6 +758,42 @@ static void mqtt_app_start(void)
 
     esp_mqtt_client_handle_t client = esp_mqtt_client_init(&mqtt_cfg);
     esp_mqtt_client_start(client);
+}
+
+// Interrupt handler for PIR signal pin
+void IRAM_ATTR pir_signal_handler(void *args)
+{
+    printf("PIR signal received\n");
+
+    int level = gpio_get_level(PIR_SIGNAL_PIN);
+    relay_status = (level == 1);
+
+    ESP_LOGI(GATTC_TAG, "PIR is %d", level);
+
+    // TODO: send MQTT message
+
+
+}
+
+static void init_pir(void)
+{
+	// Set the pin for input
+    gpio_config_t gpioConfig;
+    gpioConfig.pin_bit_mask = PIR_SIGNAL_MASK;
+    gpioConfig.mode 		= GPIO_MODE_INPUT;
+    gpioConfig.pull_up_en 	= GPIO_PULLUP_DISABLE;
+    gpioConfig.pull_down_en = GPIO_PULLDOWN_ENABLE;
+    gpioConfig.intr_type	= GPIO_INTR_ANYEDGE;
+    gpio_config(&gpioConfig);
+
+
+
+    // Enable interrupt
+    gpio_install_isr_service(0);
+    gpio_isr_handler_add(PIR_SIGNAL_PIN, pir_signal_handler, NULL);
+
+	// set initial status = OFF
+	relay_status = false;
 }
 
 void app_main()
@@ -793,6 +821,9 @@ void app_main()
 	init_wifi();
 
     mqtt_app_start();
+
+    // Initialise PIR sensor
+    init_pir();
 
     esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
     ret = esp_bt_controller_init(&bt_cfg);
@@ -834,6 +865,7 @@ void app_main()
     }
 
     while(true) {
+
         bt_scan_done = false;
         ret = esp_ble_gattc_app_register(PROFILE_A_APP_ID);
         if (ret){

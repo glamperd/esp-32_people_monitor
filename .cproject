@@ -32,6 +32,7 @@
 									<listOptionValue builtIn="false" value="&quot;${IDF_PATH}/components/mdns/include&quot;"/>
 									<listOptionValue builtIn="false" value="&quot;${IDF_PATH}/components/lwip/include/lwip&quot;"/>
 									<listOptionValue builtIn="false" value="../$(IDF_PATH)/components/espmqtt/include"/>
+									<listOptionValue builtIn="false" value="&quot;${IDF_PATH}/components/json/include&quot;"/>
 								</option>
 								<inputType id="cdt.managedbuild.tool.gnu.c.compiler.input.220929328" superClass="cdt.managedbuild.tool.gnu.c.compiler.input"/>
 							</tool>
