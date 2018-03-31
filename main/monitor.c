@@ -62,14 +62,18 @@
 #include "lwip/err.h"
 #include "lwip/netdb.h"
 #include "cJSON.h"
+#include "xtensa/core-macros.h"
+#include "driver/timer.h"
 
 
 #define GATTC_TAG "SENSOR_READ"
 #define REMOTE_SERVICE_UUID        0x00FF
 #define REMOTE_NOTIFY_CHAR_UUID    0xCA9E
-#define PROFILE_NUM      1
-#define PROFILE_A_APP_ID 0
-#define INVALID_HANDLE   0
+#define PROFILE_NUM      			1
+#define PROFILE_A_APP_ID 			0
+#define INVALID_HANDLE   			0
+#define SECONDS 					1
+#define MINUTES						60 * SECONDS
 
 //static const char *TAG = "MQTT_SAMPLE";
 
@@ -99,11 +103,21 @@ static bool mqtt_is_connected = false;
 static esp_mqtt_client_handle_t mqtt_client;
 static const char mqtt_topic_bt_info[] = "/epm/bt";
 static cJSON *status_message;
+static cJSON *pir_message;
 static const char my_id[] = "014a7d3bf12568"; // TODO this needs to be a MAC address or something
 
 // PIR sensor globals
-static const gpio_num_t PIR_SIGNAL_PIN = GPIO_NUM_18;
-static const uint64_t PIR_SIGNAL_MASK = GPIO_SEL_18;
+static const gpio_num_t PIR_SIGNAL_PIN = GPIO_NUM_15;
+static const uint64_t PIR_SIGNAL_MASK = GPIO_SEL_15;
+static QueueHandle_t isr_queue;
+
+static int64_t lastPirTime;
+#define TIMER_INTR_SEL TIMER_INTR_LEVEL  /*!< Timer level interrupt */
+#define TIMER_GROUP    TIMER_GROUP_0     /*!< Test on timer group 0 */
+#define TIMER_DIVIDER   80               /*!< Hardware timer clock divider, 80 to get 1MHz clock to timer */
+#define TIMER_SCALE    (TIMER_BASE_CLK / TIMER_DIVIDER)  /*!< used to calculate counter value */
+#define TIMER_FINE_ADJ   (0*(TIMER_BASE_CLK / TIMER_DIVIDER)/1000000) /*!< used to compensate alarm value */
+#define TIMER_INTERVAL0_SEC   (0.001)   /*!< test interval for timer 0 */
 
 /* static esp_bt_uuid_t remote_filter_service_uuid = {
     .len = ESP_UUID_LEN_128,
@@ -165,7 +179,7 @@ bool relay_status;
 int16_t sensorRssi = 0;
 bool sensorFound = false;
 
-
+static gpio_isr_handle_t isr_handle;
 
 static esp_err_t mqtt_event_handler(esp_mqtt_event_handle_t event)
 {
@@ -175,14 +189,14 @@ static esp_err_t mqtt_event_handler(esp_mqtt_event_handle_t event)
     switch (event->event_id) {
         case MQTT_EVENT_CONNECTED:
             ESP_LOGI(TAG, "MQTT_EVENT_CONNECTED");
-            msg_id = esp_mqtt_client_subscribe(mqtt_client, mqtt_topic_bt_info, 0);
-            ESP_LOGI(TAG, "sent subscribe successful, msg_id=%d", msg_id);
+            //msg_id = esp_mqtt_client_subscribe(mqtt_client, mqtt_topic_bt_info, 0);
+            //ESP_LOGI(TAG, "sent subscribe successful, msg_id=%d", msg_id);
 
-            msg_id = esp_mqtt_client_subscribe(mqtt_client, "/topic/qos1", 1);
-            ESP_LOGI(TAG, "sent subscribe successful, msg_id=%d", msg_id);
+            //msg_id = esp_mqtt_client_subscribe(mqtt_client, "/topic/qos1", 1);
+            //ESP_LOGI(TAG, "sent subscribe successful, msg_id=%d", msg_id);
 
-            msg_id = esp_mqtt_client_unsubscribe(mqtt_client, "/topic/qos1");
-            ESP_LOGI(TAG, "sent unsubscribe successful, msg_id=%d", msg_id);
+            //msg_id = esp_mqtt_client_unsubscribe(mqtt_client, "/topic/qos1");
+            //ESP_LOGI(TAG, "sent unsubscribe successful, msg_id=%d", msg_id);
             break;
         case MQTT_EVENT_DISCONNECTED:
             ESP_LOGI(TAG, "MQTT_EVENT_DISCONNECTED");
@@ -581,6 +595,7 @@ static void esp_gap_cb(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *par
             }
             break;
         case ESP_GAP_SEARCH_INQ_CMPL_EVT:
+        	bt_scan_done = true;
             break;
         default:
             break;
@@ -591,6 +606,7 @@ static void esp_gap_cb(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *par
     case ESP_GAP_BLE_SCAN_STOP_COMPLETE_EVT:
         if (param->scan_stop_cmpl.status != ESP_BT_STATUS_SUCCESS){
             ESP_LOGE(GATTC_TAG, "scan stop failed, error status = %x", param->scan_stop_cmpl.status);
+            bt_scan_done = true;
             break;
         }
         ESP_LOGI(GATTC_TAG, "stop scan successfully");
@@ -602,6 +618,7 @@ static void esp_gap_cb(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *par
             break;
         }
         ESP_LOGI(GATTC_TAG, "stop adv successfully");
+        bt_scan_done = true;
         break;
     case ESP_GAP_BLE_UPDATE_CONN_PARAMS_EVT:
          ESP_LOGI(GATTC_TAG, "update connection params status = %d, min_int = %d, max_int = %d,conn_int = %d,latency = %d, timeout = %d",
@@ -760,40 +777,130 @@ static void mqtt_app_start(void)
     esp_mqtt_client_start(client);
 }
 
-// Interrupt handler for PIR signal pin
-void IRAM_ATTR pir_signal_handler(void *args)
+static void tg0_timer0_init()
 {
-    printf("PIR signal received\n");
+    int timer_group = TIMER_GROUP_0;
+    int timer_idx = TIMER_0;
+    timer_config_t config;
+    config.alarm_en = 1;
+    config.auto_reload = 1;
+    config.counter_dir = TIMER_COUNT_UP;
+    config.divider = TIMER_DIVIDER;
+    config.intr_type = TIMER_INTR_SEL;
+    config.counter_en = TIMER_PAUSE;
 
-    int level = gpio_get_level(PIR_SIGNAL_PIN);
-    relay_status = (level == 1);
+    /*Configure timer*/
+    timer_init(timer_group, timer_idx, &config);
+    /*Stop timer counter*/
+    timer_pause(timer_group, timer_idx);
+    /*Load counter value */
+    timer_set_counter_value(timer_group, timer_idx, 0x00000000ULL);
+    /*Start timer counter*/
+    timer_start(timer_group, timer_idx);
+}
 
-    ESP_LOGI(GATTC_TAG, "PIR is %d", level);
+// Interrupt handler for PIR signal pin
+static void IRAM_ATTR pir_signal_handler(void *args)
+{
+	uint32_t gpio_intr_status = READ_PERI_REG(GPIO_STATUS_REG); // Get pin causing the int
+	SET_PERI_REG_MASK(GPIO_STATUS_W1TC_REG, gpio_intr_status); // Clear intr status
 
-    // TODO: send MQTT message
-
+    //ets_printf("PIR signal received %d\n", gpio_intr_status);
+    xQueueSendToBackFromISR(isr_queue, &PIR_SIGNAL_PIN, NULL);
 
 }
 
-static void init_pir(void)
+//int64_t cct_ElapsedTimeUs(void) {
+//  int64_t now = esp_timer_get_time();
+//  ESP_LOGI(GATTC_TAG, "esp_timer_get_time %d", now);
+//  return now - lastPirTime;/
+//}
+
+static void monitor_pir(void * parameter)
 {
+	gpio_pad_select_gpio(PIR_SIGNAL_PIN);
+	isr_queue = xQueueCreate(10, sizeof(gpio_num_t));
+	tg0_timer0_init();
+	// set initial status = OFF
+	relay_status = false;
+	pir_message = cJSON_CreateObject();
+
 	// Set the pin for input
     gpio_config_t gpioConfig;
     gpioConfig.pin_bit_mask = PIR_SIGNAL_MASK;
     gpioConfig.mode 		= GPIO_MODE_INPUT;
     gpioConfig.pull_up_en 	= GPIO_PULLUP_DISABLE;
-    gpioConfig.pull_down_en = GPIO_PULLDOWN_ENABLE;
+    gpioConfig.pull_down_en = GPIO_PULLDOWN_DISABLE;
     gpioConfig.intr_type	= GPIO_INTR_ANYEDGE;
-    gpio_config(&gpioConfig);
-
+    esp_err_t res = gpio_config(&gpioConfig);
+    ESP_LOGI(GATTC_TAG, "gpio_config: %d", res);
 
 
     // Enable interrupt
-    gpio_install_isr_service(0);
-    gpio_isr_handler_add(PIR_SIGNAL_PIN, pir_signal_handler, NULL);
+    res = gpio_isr_register(pir_signal_handler, NULL, 0, &isr_handle);
+    //res = gpio_install_isr_service(ESP_INTR_FLAG_LEVEL1);
+    ESP_LOGI(GATTC_TAG, "registered ISR %d", res);
 
-	// set initial status = OFF
-	relay_status = false;
+    /* if (res == ESP_OK)
+    {
+    	res = gpio_isr_handler_add(PIR_SIGNAL_PIN, pir_signal_handler, NULL);
+    	ESP_LOGE(GATTC_TAG, "installed ISR handler %d", res);
+	*/
+
+		while(true) {
+			gpio_num_t pin;
+			struct AMessage *rxedMsg;
+			BaseType_t rc = xQueueReceive(isr_queue, &( rxedMsg ), portMAX_DELAY);
+			ESP_LOGD(GATTC_TAG, "Woke on PIR queue entry");
+		    int level = gpio_get_level(PIR_SIGNAL_PIN);
+		    relay_status = (level == 1);
+
+		    ESP_LOGI(GATTC_TAG, "PIR is %d", level);
+
+		    if (relay_status)
+		    {
+		    	double elapsed;
+		    	timer_get_counter_time_sec(TIMER_GROUP, TIMER_0, &elapsed);
+
+		    	ESP_LOGI(GATTC_TAG, "elapsed time is %f secs", elapsed);
+			    // If high, send MQTT message
+			    if (elapsed > 3 * MINUTES)
+			    {
+			    	if (!mqtt_is_connected)
+			    	{
+			    		mqtt_app_start();
+			    		vTaskDelay(1000);
+			    	}
+			    	if (mqtt_is_connected)
+			    	{
+						// Create cJSON object
+						cJSON_AddStringToObject(pir_message, "name", my_id);
+						cJSON_AddNumberToObject(pir_message, "pir", relay_status);
+						char *temp = cJSON_Print(pir_message);
+						int msg_id = esp_mqtt_client_publish(mqtt_client, mqtt_topic_bt_info, temp, 0, 0, 0);
+						ESP_LOGI(TAG, "sent publish successful, msg_id=%d", msg_id);
+			    	}
+			    }
+
+		    	//lastPirTime = esp_timer_get_time();
+		        timer_pause(TIMER_GROUP, TIMER_0);
+		        /*Load counter value */
+		        timer_set_counter_value(TIMER_GROUP, TIMER_0, 0x00000000ULL);
+		        /*Set alarm value*/
+		        //timer_set_alarm_value(timer_group, timer_idx, (TIMER_INTERVAL0_SEC * TIMER_SCALE) - TIMER_FINE_ADJ);
+		        /*Start timer counter*/
+		        timer_start(TIMER_GROUP, TIMER_0);
+		    }
+
+		    //vTaskDelay(1000 / portTICK_PERIOD_MS);
+		    //gpio_intr_enable(PIR_SIGNAL_PIN);
+
+		}
+    //}
+
+	vTaskDelete(NULL);
+
+	return;
 }
 
 void app_main()
@@ -822,8 +929,9 @@ void app_main()
 
     mqtt_app_start();
 
+    TaskHandle_t xPirInterruptTask;
     // Initialise PIR sensor
-    init_pir();
+    xTaskCreatePinnedToCore(monitor_pir, "PIR int", 2048, NULL, 5, &xPirInterruptTask, 1);
 
     esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
     ret = esp_bt_controller_init(&bt_cfg);
@@ -884,6 +992,7 @@ void app_main()
         
         printf("%llu: light sleep start\n", 0llu);
         esp_sleep_enable_timer_wakeup(30000000);
+        esp_sleep_enable_ext0_wakeup(PIR_SIGNAL_PIN, GPIO_INTR_HIGH_LEVEL);
         esp_light_sleep_start();
         printf("%llu: light sleep out\n", 1llu);
 
