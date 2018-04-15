@@ -3,7 +3,7 @@
 # project subdirectory.
 #
 
-PROJECT_NAME := gatt_client_demo
+PROJECT_NAME := esp32-people-monitor
 
 COMPONENT_ADD_INCLUDEDIRS := components/include
 

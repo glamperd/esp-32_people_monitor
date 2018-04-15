@@ -56,3 +56,7 @@ sdkconfig
 sdkconfig.old
 sdkconfig
 sdkconfig.old
+
+sdkconfig
+*.old
+sdkconfig2.home
