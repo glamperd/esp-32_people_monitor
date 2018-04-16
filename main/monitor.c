@@ -119,6 +119,8 @@ static int64_t lastPirTime;
 #define TIMER_FINE_ADJ   (0*(TIMER_BASE_CLK / TIMER_DIVIDER)/1000000) /*!< used to compensate alarm value */
 #define TIMER_INTERVAL0_SEC   (0.001)   /*!< test interval for timer 0 */
 
+static QueueHandle_t wifi_msg_queue; /* Queues messages until wifi connects */
+
 /* static esp_bt_uuid_t remote_filter_service_uuid = {
     .len = ESP_UUID_LEN_128,
     .uuid = {.uuid16 = REMOTE_SERVICE_UUID,},
@@ -925,6 +927,7 @@ void app_main()
     ESP_ERROR_CHECK( ret );
 
 	// Connect to wifi router
+    wifi_msg_queue = xQueueCreate(10, 256);
 	init_wifi();
 
     mqtt_app_start();

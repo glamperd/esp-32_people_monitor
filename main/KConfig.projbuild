@@ -1,0 +1,15 @@
+menu "People monitor configuration"
+
+config WIFI_SSID
+    string "SSID"
+
+config WIFI_PASSWORD
+    string "Password"
+
+config RELAY_PIN
+    int "Number of the PIN connected to the RELAY"
+	range 0 34
+	default 0
+	
+endmenu
+
